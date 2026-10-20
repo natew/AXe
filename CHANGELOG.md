@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Keep all simulator HID input in the persistent broker so taps, hardware buttons, typing and batch gestures survive the CLI process exiting. Invalidate the broker when the simulator or its DTUHID service changes process identity.
+- Keep all simulator HID input in the persistent broker so taps, hardware buttons, typing and batch gestures survive the CLI process exiting. Invalidate the broker when the simulator or its DTUHID service changes process identity ([#78](https://github.com/cameroncooke/AXe/pull/78) by [@natew](https://github.com/natew)).
 
 ## [v1.8.0] - 2026-07-20
 
