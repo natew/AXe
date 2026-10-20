@@ -26,6 +26,7 @@ struct HIDBrokerPrimitive: Codable, Equatable {
 
 private struct HIDBrokerRequest: Codable {
     let primitives: [HIDBrokerPrimitive]
+    var event: HIDBrokerEvent? = nil
 }
 
 struct HIDBrokerBootIdentity: Equatable {
@@ -37,8 +38,8 @@ struct HIDBrokerBootIdentity: Equatable {
 enum HIDBroker {
     static let inputDeliveryFailureDescription = "AXe could not deliver simulator input. The simulator may have restarted or disconnected. Confirm it is booted and try again."
     static let dtuhidMinimumBootUptime: TimeInterval = 10
-    private static let protocolVersion = 2
-    static let maximumMessageBytes = 64 * 1024
+    private static let protocolVersion = 3
+    static let maximumMessageBytes = 4 * 1024 * 1024
     private static let idleTimeoutMilliseconds: Int32 = 60_000
     static let serverIOTimeoutMilliseconds: Int = 2_000
     static let clientWriteTimeoutMilliseconds: Int = 2_000
@@ -73,6 +74,24 @@ enum HIDBroker {
         try exchange(requestData, on: descriptor)
     }
 
+    static func sendEvent(_ event: FBSimulatorHIDEvent, simulatorUDID: String) throws {
+        let endpoint = try endpointPath(simulatorUDID: simulatorUDID)
+        let wireEvent = try HIDBrokerEvent(event)
+        var data = try JSONEncoder().encode(HIDBrokerRequest(primitives: [], event: wireEvent))
+        data.append(0x0A)
+        guard data.count <= maximumMessageBytes else {
+            throw CLIError(errorDescription: "HID broker request exceeds the maximum size.")
+        }
+        let descriptor = try connectToReadyBroker(simulatorUDID: simulatorUDID, endpoint: endpoint)
+        defer { Darwin.close(descriptor) }
+        try configureSocketTimeouts(
+            descriptor,
+            readMilliseconds: clientResponseTimeoutMilliseconds + Int(try wireEvent.durationBudget * 1000),
+            writeMilliseconds: clientWriteTimeoutMilliseconds
+        )
+        try exchange(data, on: descriptor)
+    }
+
     @MainActor
     static func serve(simulatorUDID: String, logger: AxeLogger) async throws {
         let endpoint = try endpointPath(simulatorUDID: simulatorUDID)
@@ -84,7 +103,8 @@ enum HIDBroker {
         }
 
         let bootIdentity = try currentBootIdentity(simulatorUDID: simulatorUDID)
-        let session = try await HIDInteractor.makeSession(for: simulatorUDID, logger: logger)
+        let session = try await HIDInteractor.makeSession(for: simulatorUDID, logger: logger, ownsConnection: true)
+        let hidIdentity = try currentHIDIdentity(simulatorUDID: simulatorUDID)
         while true {
             var pollDescriptor = pollfd(fd: listener, events: Int16(POLLIN), revents: 0)
             let result = Darwin.poll(&pollDescriptor, 1, idleTimeoutMilliseconds)
@@ -110,7 +130,7 @@ enum HIDBroker {
             guard shouldReuseSession(
                 sessionBootIdentity: bootIdentity,
                 currentBootIdentity: try currentBootIdentity(simulatorUDID: simulatorUDID)
-            ) else {
+            ), hidIdentity == (try currentHIDIdentity(simulatorUDID: simulatorUDID)) else {
                 try? writeHandshake(ready: false, to: client)
                 Darwin.close(client)
                 return
@@ -121,7 +141,7 @@ enum HIDBroker {
                 Darwin.close(client)
                 continue
             }
-            let shouldContinue = await handle(client: client, session: session, logger: logger)
+            let shouldContinue = await handle(client: client, session: session, bootIdentity: bootIdentity, hidIdentity: hidIdentity, logger: logger)
             Darwin.close(client)
             if !shouldContinue {
                 return
@@ -133,6 +153,8 @@ enum HIDBroker {
     private static func handle(
         client: Int32,
         session: HIDInteractor.Session,
+        bootIdentity: HIDBrokerBootIdentity,
+        hidIdentity: HIDBrokerBootIdentity?,
         logger: AxeLogger
     ) async -> Bool {
         var peerUID: uid_t = 0
@@ -146,6 +168,14 @@ enum HIDBroker {
         do {
             let data = try readMessage(from: client)
             let request = try JSONDecoder().decode(HIDBrokerRequest.self, from: data)
+            if let event = request.event {
+                do {
+                    try await HIDInteractor.performHIDEvent(try event.nativeEvent(), in: session, logger: logger)
+                } catch {
+                    shouldContinue = false
+                    throw error
+                }
+            }
             for primitive in request.primitives {
                 switch primitive.kind {
                 case .down, .up:
@@ -169,6 +199,11 @@ enum HIDBroker {
                     }
                     try await Task.sleep(for: .seconds(duration))
                 }
+            }
+            guard bootIdentity == (try currentBootIdentity(simulatorUDID: session.simulatorUDID)),
+                  hidIdentity == (try currentHIDIdentity(simulatorUDID: session.simulatorUDID)) else {
+                shouldContinue = false
+                throw CLIError(errorDescription: inputDeliveryFailureDescription)
             }
             try writeResponse(error: nil, to: client)
         } catch {

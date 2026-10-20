@@ -17,6 +17,12 @@ extension HIDBroker {
         return identity
     }
 
+    static func currentHIDIdentity(simulatorUDID: String) throws -> HIDBrokerBootIdentity? {
+        let boot = try currentBootIdentity(simulatorUDID: simulatorUDID)
+        let pid = FBProcessFetcher().subprocess(of: boot.processIdentifier, withName: "dtuhidd")
+        return pid > 0 ? bootIdentity(processIdentifier: pid) : nil
+    }
+
     private static func bootIdentity(processIdentifier: pid_t) -> HIDBrokerBootIdentity? {
         var processInfo = proc_bsdinfo()
         let expectedSize = MemoryLayout<proc_bsdinfo>.size

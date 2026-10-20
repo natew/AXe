@@ -14,7 +14,7 @@ struct HIDInteractor {
     struct Session {
         let simulatorUDID: String
         let simulator: FBSimulator
-        let hid: FBSimulatorHID
+        let hid: FBSimulatorHID?
     }
 
     // Cache for HID connections per simulator
@@ -29,7 +29,7 @@ struct HIDInteractor {
         return 25
     }
 
-    static func makeSession(for simulatorUDID: String, logger: AxeLogger) async throws -> Session {
+    static func makeSession(for simulatorUDID: String, logger: AxeLogger, ownsConnection: Bool = false) async throws -> Session {
         logger.info().log("Loading private frameworks for HID operations...")
         let frameworkLoader = FBSimulatorControlFrameworkLoader.xcodeFrameworks
         do {
@@ -60,7 +60,13 @@ struct HIDInteractor {
         }
         logger.info().log("Simulator state verified: booted")
 
+        // command processes never open a competing connection to the broker's virtual devices.
+        if !ownsConnection {
+            return Session(simulatorUDID: simulatorUDID, simulator: simulator, hid: nil)
+        }
+
         let bootIdentity = try HIDBroker.currentBootIdentity(simulatorUDID: simulatorUDID)
+        let hidIdentity = try HIDBroker.currentHIDIdentity(simulatorUDID: simulatorUDID)
         let dtuhidProcessIdentifier = FBProcessFetcher().subprocess(
             of: bootIdentity.processIdentifier,
             withName: "dtuhidd"
@@ -79,7 +85,7 @@ struct HIDInteractor {
         guard HIDBroker.shouldReuseSession(
             sessionBootIdentity: bootIdentity,
             currentBootIdentity: connectedBootIdentity
-        ) else {
+        ), hidIdentity == (try HIDBroker.currentHIDIdentity(simulatorUDID: simulatorUDID)) else {
             hidConnections.removeValue(forKey: simulatorUDID)
             throw CLIError(
                 errorDescription: "Simulator \(simulatorUDID) restarted while AXe was connecting. Try the command again."
@@ -96,7 +102,11 @@ struct HIDInteractor {
 
     static func performHIDEvent(_ event: FBSimulatorHIDEvent, in session: Session, logger: AxeLogger) async throws {
         logger.info().log("Performing HID event...")
-        try await session.hid.send(event: event, logger: logger)
+        if let hid = session.hid {
+            try await hid.send(event: event, logger: logger)
+        } else {
+            try HIDBroker.sendEvent(event, simulatorUDID: session.simulatorUDID)
+        }
         logger.info().log("HID event performed successfully.")
 
         if stabilizationDelayMs > 0 {
