@@ -168,21 +168,38 @@ enum HIDBroker {
         do {
             let data = try readMessage(from: client)
             let request = try JSONDecoder().decode(HIDBrokerRequest.self, from: data)
-            if let event = request.event {
-                do {
-                    try await HIDInteractor.performHIDEvent(try event.nativeEvent(), in: session, logger: logger)
-                } catch {
-                    shouldContinue = false
-                    throw error
-                }
-            }
             // touches are issued on the requested schedule and their acks awaited afterwards: a
             // send blocks until DTUHID acks it, so awaiting each one inline would add that ack
-            // latency to every hold.
+            // latency to every hold, drag step and long press.
             let clock = ContinuousClock()
             var due = clock.now
             var sends: [Task<Void, Error>] = []
+            func schedule(_ event: HIDBrokerEvent) async throws {
+                switch event {
+                case let .composite(events):
+                    for event in events { try await schedule(event) }
+                case let .delay(duration):
+                    guard duration.isFinite, duration >= 0, duration <= 86_400 else {
+                        throw CLIError(errorDescription: "Invalid HID delay.")
+                    }
+                    due += .seconds(duration)
+                case .touch:
+                    try await Task.sleep(until: due, clock: clock)
+                    let native = try event.nativeEvent()
+                    sends.append(Task { @MainActor in
+                        try await HIDInteractor.performHIDEvent(native, in: session, logger: logger)
+                    })
+                default:
+                    // other events keep their inline ack; later events are due after it returns
+                    try await Task.sleep(until: due, clock: clock)
+                    try await HIDInteractor.performHIDEvent(try event.nativeEvent(), in: session, logger: logger)
+                    due = max(due, clock.now)
+                }
+            }
             do {
+                if let event = request.event {
+                    try await schedule(event)
+                }
                 for primitive in request.primitives {
                     switch primitive.kind {
                     case .down, .up:
@@ -190,19 +207,12 @@ enum HIDBroker {
                             throw CLIError(errorDescription: "Touch primitive is missing coordinates.")
                         }
                         let direction: FBSimulatorHIDDirection = primitive.kind == .down ? .down : .up
-                        try await Task.sleep(until: due, clock: clock)
-                        sends.append(Task { @MainActor in
-                            try await HIDInteractor.performHIDEvent(
-                                .touch(direction: direction, x: x, y: y),
-                                in: session,
-                                logger: logger
-                            )
-                        })
+                        try await schedule(.touch(direction.rawValue, x, y))
                     case .delay:
                         guard let duration = primitive.duration, duration >= 0, duration <= 10 else {
                             throw CLIError(errorDescription: "HID broker delay is invalid.")
                         }
-                        due += .seconds(duration)
+                        try await schedule(.delay(duration))
                     }
                 }
                 try await Task.sleep(until: due, clock: clock)
