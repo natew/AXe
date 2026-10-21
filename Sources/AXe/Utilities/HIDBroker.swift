@@ -176,28 +176,47 @@ enum HIDBroker {
                     throw error
                 }
             }
-            for primitive in request.primitives {
-                switch primitive.kind {
-                case .down, .up:
-                    guard let x = primitive.x, let y = primitive.y else {
-                        throw CLIError(errorDescription: "Touch primitive is missing coordinates.")
+            // touches are issued on the requested schedule and their acks awaited afterwards: a
+            // send blocks until DTUHID acks it, so awaiting each one inline would add that ack
+            // latency to every hold.
+            let clock = ContinuousClock()
+            var due = clock.now
+            var sends: [Task<Void, Error>] = []
+            do {
+                for primitive in request.primitives {
+                    switch primitive.kind {
+                    case .down, .up:
+                        guard let x = primitive.x, let y = primitive.y else {
+                            throw CLIError(errorDescription: "Touch primitive is missing coordinates.")
+                        }
+                        let direction: FBSimulatorHIDDirection = primitive.kind == .down ? .down : .up
+                        try await Task.sleep(until: due, clock: clock)
+                        sends.append(Task { @MainActor in
+                            try await HIDInteractor.performHIDEvent(
+                                .touch(direction: direction, x: x, y: y),
+                                in: session,
+                                logger: logger
+                            )
+                        })
+                    case .delay:
+                        guard let duration = primitive.duration, duration >= 0, duration <= 10 else {
+                            throw CLIError(errorDescription: "HID broker delay is invalid.")
+                        }
+                        due += .seconds(duration)
                     }
-                    let direction: FBSimulatorHIDDirection = primitive.kind == .down ? .down : .up
-                    do {
-                        try await HIDInteractor.performHIDEvent(
-                            .touch(direction: direction, x: x, y: y),
-                            in: session,
-                            logger: logger
-                        )
-                    } catch {
-                        shouldContinue = false
-                        throw error
-                    }
-                case .delay:
-                    guard let duration = primitive.duration, duration >= 0, duration <= 10 else {
-                        throw CLIError(errorDescription: "HID broker delay is invalid.")
-                    }
-                    try await Task.sleep(for: .seconds(duration))
+                }
+                try await Task.sleep(until: due, clock: clock)
+            } catch {
+                shouldContinue = false
+                for send in sends { _ = await send.result }
+                throw error
+            }
+            for send in sends {
+                do {
+                    try await send.value
+                } catch {
+                    shouldContinue = false
+                    throw error
                 }
             }
             guard bootIdentity == (try currentBootIdentity(simulatorUDID: session.simulatorUDID)),
